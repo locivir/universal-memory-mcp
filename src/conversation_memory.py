@@ -6,6 +6,7 @@ This module contains the core conversation memory functionality
 shared between the FastMCP server and standalone implementations.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -94,6 +95,10 @@ class ConversationMemoryServer:
 
         # Sync index.json with conversation files on disk
         self._sync_index_from_files()
+
+        # Serialize authoritative replica writes. A repeated batch is safe,
+        # but two concurrent batches must not both decide a session is absent.
+        self._conversation_sync_lock = asyncio.Lock()
 
     def _detect_data_directory_structure(self) -> bool:
         """
@@ -1015,6 +1020,127 @@ class ConversationMemoryServer:
         if not isinstance(conversation, dict) or conversation.get("id") != conversation_id:
             return {"error": f"Conversation file identity mismatch: {conversation_id}"}
         return conversation
+
+    def _scan_conversations_by_session_id(
+        self, session_ids: set[str]
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Read authoritative JSON records for the requested session IDs."""
+        matches: dict[str, list[dict[str, Any]]] = {session_id: [] for session_id in session_ids}
+        for file_path in self.conversations_path.rglob("conv_*.json"):
+            try:
+                with open(file_path, encoding="utf-8") as f:
+                    conversation = json.load(f)
+            except (OSError, ValueError, TypeError):
+                continue
+
+            if not isinstance(conversation, dict):
+                continue
+            session_id = conversation.get("session_id")
+            if session_id in matches:
+                matches[session_id].append(conversation)
+        return matches
+
+    async def sync_conversations(self, conversations: list[dict[str, Any]]) -> dict[str, Any]:
+        """Idempotently upsert authoritative conversations by session ID.
+
+        Every input record must contain a unique non-empty ``session_id``.
+        Existing records keep their internal conversation ID and creation
+        date. The source title and content replace prior values verbatim and
+        no interactive audit line is added.
+        """
+        session_ids = [conversation["session_id"] for conversation in conversations]
+        if len(session_ids) != len(set(session_ids)):
+            return {
+                "status": "error",
+                "added": 0,
+                "updated": 0,
+                "unchanged": 0,
+                "errors": [{"message": "Duplicate session_id in synchronization batch"}],
+            }
+
+        result: dict[str, Any] = {
+            "status": "success",
+            "added": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "errors": [],
+        }
+        if not conversations:
+            return result
+
+        async with self._conversation_sync_lock:
+            existing_by_session = await asyncio.to_thread(
+                self._scan_conversations_by_session_id, set(session_ids)
+            )
+
+            for incoming in conversations:
+                session_id = incoming["session_id"]
+                matches = existing_by_session[session_id]
+                if len(matches) > 1:
+                    result["errors"].append(
+                        {
+                            "session_id": session_id,
+                            "message": "Multiple stored conversations use this session_id",
+                        }
+                    )
+                    continue
+
+                if not matches:
+                    add_result = await self.add_conversation(
+                        incoming["content"],
+                        incoming["title"],
+                        incoming.get("date"),
+                        session_id=session_id,
+                        tags=incoming.get("tags"),
+                        conversation_type=incoming.get("conversation_type"),
+                        custom_fields=incoming.get("custom_fields"),
+                    )
+                    if add_result["status"] == "success":
+                        result["added"] += 1
+                    else:
+                        result["errors"].append(
+                            {"session_id": session_id, "message": add_result["message"]}
+                        )
+                    continue
+
+                existing = matches[0]
+                add_tags = [
+                    tag
+                    for tag in incoming.get("tags") or []
+                    if tag not in (existing.get("tags") or [])
+                ]
+                content = (
+                    incoming["content"] if incoming["content"] != existing.get("content") else None
+                )
+                title = incoming["title"] if incoming["title"] != existing.get("title") else None
+                conversation_type = (
+                    incoming.get("conversation_type")
+                    if incoming.get("conversation_type") != existing.get("conversation_type")
+                    else None
+                )
+
+                if content is None and title is None and not add_tags and conversation_type is None:
+                    result["unchanged"] += 1
+                    continue
+
+                update_result = await self.update_conversation(
+                    existing["id"],
+                    content=content,
+                    title=title,
+                    add_tags=add_tags or None,
+                    conversation_type=conversation_type,
+                    record_audit=False,
+                )
+                if update_result["status"] == "success":
+                    result["updated"] += 1
+                else:
+                    result["errors"].append(
+                        {"session_id": session_id, "message": update_result["message"]}
+                    )
+
+        if result["errors"]:
+            result["status"] = "partial" if result["added"] or result["updated"] else "error"
+        return result
 
     def _update_index(self, conversation_data: dict, file_path: Path):
         """Update the main index with new conversation"""

@@ -6,7 +6,10 @@ This MCP server provides tools for managing and searching Claude conversation hi
 Supports storing conversations locally and retrieving context for current sessions.
 """
 
+import json
+import re
 from pathlib import Path
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -26,7 +29,10 @@ from logging_config import (
     set_correlation_id,
 )
 from validators import (
+    MAX_TITLE_LENGTH,
+    validate_content,
     validate_conversation_type,
+    validate_date,
     validate_session_id,
     validate_tags,
     validate_user_id,
@@ -43,6 +49,9 @@ MAX_RESULTS_DISPLAY = 10
 DEFAULT_CONVERSATION_CHARS = 12000
 MAX_CONVERSATION_CHARS = 50000
 UTC_OFFSET_REPLACEMENT = "+00:00"
+MAX_SYNC_BATCH_SIZE = 50
+MAX_SYNC_SOURCE_LENGTH = 64
+SYNC_SOURCE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 COMMON_TECH_TERMS = [
     "python",
@@ -350,6 +359,86 @@ async def get_conversation(
         else:
             response += "\n\n[Content truncated at the server maximum.]"
     return response
+
+
+def _normalize_sync_batch(source: str, conversations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Validate a replica batch and map source IDs to universal session IDs."""
+    if not isinstance(source, str):
+        raise ValidationError("source must be a string")
+    source = source.strip()
+    if (
+        not source
+        or len(source) > MAX_SYNC_SOURCE_LENGTH
+        or not SYNC_SOURCE_PATTERN.fullmatch(source)
+    ):
+        raise ValidationError(
+            "source must start with an alphanumeric character and contain only letters, numbers, '.', '_' or '-'"
+        )
+    if not isinstance(conversations, list):
+        raise ValidationError("conversations must be a list")
+    if len(conversations) > MAX_SYNC_BATCH_SIZE:
+        raise ValidationError(
+            f"Synchronization batch has {len(conversations)} records (max {MAX_SYNC_BATCH_SIZE})"
+        )
+
+    normalized: list[dict[str, Any]] = []
+    for index, conversation in enumerate(conversations):
+        if not isinstance(conversation, dict):
+            raise ValidationError(f"conversations[{index}] must be an object")
+
+        source_id = conversation.get("source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValidationError(f"conversations[{index}].source_id must be a non-empty string")
+        source_id = source_id.strip()
+        session_id = validate_session_id(f"{source}:{source_id}")
+        if session_id is None:
+            raise ValidationError(f"conversations[{index}].source_id is invalid")
+
+        title = conversation.get("title")
+        if not isinstance(title, str):
+            raise ValidationError(f"conversations[{index}].title must be a string")
+        title = title.strip() or "Untitled Conversation"
+        if len(title) > MAX_TITLE_LENGTH:
+            raise ValidationError(
+                f"conversations[{index}].title is too long ({len(title)} characters; max {MAX_TITLE_LENGTH})"
+            )
+        if "\x00" in title:
+            raise ValidationError(f"conversations[{index}].title contains null bytes")
+
+        content = conversation.get("content")
+        if not isinstance(content, str):
+            raise ValidationError(f"conversations[{index}].content must be a string")
+        content = validate_content(content)
+
+        date_value = validate_date(conversation.get("date"))
+        conversation_type = validate_conversation_type(
+            conversation.get("conversation_type", "chat")
+        )
+        normalized.append(
+            {
+                "content": content,
+                "conversation_type": conversation_type,
+                "custom_fields": {"sync_source": source, "sync_source_id": source_id},
+                "date": date_value.isoformat() if date_value is not None else None,
+                "session_id": session_id,
+                "tags": [f"source:{source}"],
+                "title": title,
+            }
+        )
+    return normalized
+
+
+@mcp.tool()
+async def sync_conversations(source: str, conversations: list[dict[str, Any]]) -> str:
+    """Internal idempotent upsert endpoint for an authoritative client replica."""
+    set_correlation_id()
+    try:
+        normalized = _normalize_sync_batch(source, conversations)
+    except ValidationError as e:
+        return json.dumps({"status": "error", "message": str(e)}, sort_keys=True)
+
+    result = await memory_server.sync_conversations(normalized)
+    return json.dumps(result, ensure_ascii=False, sort_keys=True)
 
 
 @mcp.tool()
